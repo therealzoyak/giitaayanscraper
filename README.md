@@ -1,5 +1,5 @@
 # Giitaayan Song Scraper
-**CWL 207 – Indian Cinema in Context**
+**FOR CWL 207 – Indian Cinema in Context**
 
 Scrapes song metadata from [new.giitaayan.com](https://new.giitaayan.com) and enriches it with IMDb film IDs using Cinemagoer.
 
