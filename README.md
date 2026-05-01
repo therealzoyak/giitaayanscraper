@@ -11,6 +11,9 @@ Scrapes song metadata from [new.giitaayan.com](https://new.giitaayan.com) and en
 2. Looks up each unique film on TMDb to get its IMDb `tt` ID
 3. Saves everything to `giitaayan_songs.csv`
 
+## Included
+
+The code file and the final dataset
 ---
 
 ## Setup
