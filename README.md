@@ -49,9 +49,3 @@ POST https://db.giitaayan.com/rest/v1/rpc/search_song_stats
 
 We query this endpoint year by year (1930–2025) using `search_terms: "year:XXXX"` to collect all songs. IMDb IDs are then resolved using the TMDb API with fuzzy title matching.
 
----
-
-## Group Info
-- Course: CWL 207 – Indian Cinema in Context
-- Task: Scrape Giitaayan (~3,500 songs) and add IMDb film IDs
-- Due: April 30, 2026
