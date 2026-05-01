@@ -1,82 +1,57 @@
 # Giitaayan Song Scraper
-**FOR CWL 207 – Indian Cinema in Context**
+**CWL 207 – Indian Cinema in Context**
 
-Scrapes song metadata from [new.giitaayan.com](https://new.giitaayan.com) and enriches it with IMDb film IDs using Cinemagoer.
+Scrapes song metadata from [new.giitaayan.com](https://new.giitaayan.com) and enriches it with IMDb film IDs using the TMDb API.
+
+---
+
+## What This Does
+
+1. Calls the Giitaayan API directly (no browser needed) to collect all ~3,445 songs from 1930–2025
+2. Looks up each unique film on TMDb to get its IMDb `tt` ID
+3. Saves everything to `giitaayan_songs.csv`
 
 ---
 
 ## Setup
 
 ```bash
-pip install selenium cinemagoer pandas webdriver-manager
+pip install requests pandas rapidfuzz
 ```
-
-You also need **Google Chrome** installed on your computer (the scraper controls it automatically).
 
 ---
 
 ## Run
 
 ```bash
-python giitaayan_scraper.py
+python3 giitaayan_scraper.py
 ```
-
-This will:
-1. Open Giitaayan in a headless Chrome browser
-2. Scroll through and collect all songs
-3. Look up each film on IMDb to get its `tt` ID
-4. Save everything to `giitaayan_songs.csv`
 
 ---
 
 ## Output
 
-A CSV file (`giitaayan_songs.csv`) with columns like:
+`giitaayan_songs.csv` with the following columns:
 
-| song_title | film | singer | imdb_id |
-|---|---|---|---|
-| Tere Bina | Guru | Chinmayi | tt0449994 |
+| song_title | album | year | singer | lyricist | composer | imdb_id |
+|---|---|---|---|---|---|---|
+| saa.Nwar waalaa vahii re | Pukaar | 1939 | Naseem, Sardar Akhtar | Kamal Amrohi | Mir Sahab | tt0032599 |
 
 ---
 
-## ⚠️ Important: Updating the CSS Selectors
+## How It Works
 
-Because Giitaayan is a React app, the HTML it generates uses
-auto-generated class names that **you need to find yourself**.
+Giitaayan uses a Supabase backend. By inspecting the site's network requests, we found the API endpoint it calls to load songs:
 
-Here's how:
-
-1. Open [https://new.giitaayan.com/](https://new.giitaayan.com/) in Chrome
-2. Right-click on a song title → click **Inspect**
-3. In the DevTools panel, look at what HTML element wraps each song
-4. Note the class name or tag (e.g. `<div class="song-item">`)
-5. Update this line in `giitaayan_scraper.py`:
-
-```python
-song_elements = driver.find_elements(By.CSS_SELECTOR, "[class*='song']")
+```
+POST https://db.giitaayan.com/rest/v1/rpc/search_song_stats
 ```
 
-Replace `"[class*='song']"` with whatever selector matches what you found.
-
----
-
-## Finding the Hidden API (Easier Method)
-
-Giitaayan likely calls its own backend API to load songs. You can find it:
-
-1. Open [https://new.giitaayan.com/](https://new.giitaayan.com/) in Chrome
-2. Open DevTools → **Network** tab
-3. Filter by **Fetch/XHR**
-4. Refresh the page and scroll
-5. Look for requests to URLs like `/api/songs` or `/api/giits`
-6. Click one → look at the **Response** tab to see the JSON
-
-If you find a clean API endpoint, you can replace the Selenium code
-with a simple `requests.get(url)` call — much faster and more reliable.
+We query this endpoint year by year (1930–2025) using `search_terms: "year:XXXX"` to collect all songs. IMDb IDs are then resolved using the TMDb API with fuzzy title matching.
 
 ---
 
 ## Group Info
-- Course: CWL 207
-- Task: Scrape Giitaayan (~3500 songs) + Add IMDb IDs
+- Course: CWL 207 – Indian Cinema in Context
+- Task: Scrape Giitaayan (~3,500 songs) and add IMDb film IDs
 - Due: April 30, 2026
