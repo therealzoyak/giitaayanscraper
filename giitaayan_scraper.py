@@ -1,127 +1,217 @@
-"""
-Giitaayan Song Scraper + IMDb ID Matcher
-CWL 207 - Indian Cinema in Context
+"""Build a searchable Giitaayan song dataset and optionally enrich films with IMDb IDs.
 
-Requirements:
-    pip install requests pandas rapidfuzz
-
-Usage:
-    python3 giitaayan_scraper.py
-
-Output:
-    giitaayan_songs.csv
+The scraper talks to the same public Supabase RPC used by Giitaayan's web app.
+Credentials are read from environment variables so the repository never contains
+private API keys.
 """
 
+from __future__ import annotations
+
+import argparse
+import os
 import time
-import requests
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
+import requests
 from rapidfuzz import fuzz
 
-# ── Giitaayan API config ──────────────────────────────────────────
-API_URL = "https://db.giitaayan.com/rest/v1/rpc/search_song_stats"
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndyanptZXJuY2FndHV5aHVicGFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzI0MjI2ODYsImV4cCI6MjA0Nzk5ODY4Nn0.YxLVtKQIcBH8RRSMdMDRT1_p_5_pZFyOQx37NuhHZ6U",
-    "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndyanptZXJuY2FndHV5aHVicGFlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzI0MjI2ODYsImV4cCI6MjA0Nzk5ODY4Nn0.YxLVtKQIcBH8RRSMdMDRT1_p_5_pZFyOQx37NuhHZ6U"
-}
-
-START_YEAR = 1930
-END_YEAR   = 2025
-
-# ── TMDb / IMDb config (your friend's code) ───────────────────────
-TMDB_API_KEY   = "7075c36b5198aa7c004aedb756385408"
-TMDB_BASE      = "https://api.themoviedb.org/3"
+GIITAAYAN_API_URL = "https://db.giitaayan.com/rest/v1/rpc/search_song_stats"
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
 MIN_MATCH_SCORE = 80
-YEAR_TOLERANCE  = 1
-_imdb_cache: dict = {}
+YEAR_TOLERANCE = 1
 
-def _score(query_title, query_year, cand):
-    name = max(
-        fuzz.token_set_ratio(query_title.lower(), (cand.get("title") or "").lower()),
-        fuzz.token_set_ratio(query_title.lower(), (cand.get("original_title") or "").lower()),
+
+def build_headers(api_key: str) -> dict[str, str]:
+    """Return the headers required by Giitaayan's Supabase endpoint."""
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "apikey": api_key,
+        "Authorization": f"Bearer {api_key}",
+    }
+
+
+def fetch_year(
+    session: requests.Session,
+    year: int,
+    giitaayan_api_key: str,
+) -> list[dict[str, Any]]:
+    """Fetch one year of Giitaayan records with explicit failure reporting."""
+    response = session.post(
+        GIITAAYAN_API_URL,
+        json={"search_terms": f"year:{year}", "similarity_threshold": 0.1},
+        headers=build_headers(giitaayan_api_key),
+        timeout=20,
     )
-    rd = cand.get("release_date") or ""
-    cand_year = int(rd[:4]) if len(rd) >= 4 and rd[:4].isdigit() else None
-    penalty = 0.0
-    if query_year and cand_year and abs(cand_year - query_year) > YEAR_TOLERANCE:
-        penalty = min(40.0, abs(cand_year - query_year) * 5.0)
-    elif query_year and not cand_year:
-        penalty = 5.0
-    bonus = 3.0 if (cand.get("original_language") or "") == "hi" else 0.0
-    return name - penalty + bonus
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError(f"Unexpected Giitaayan response for {year}: {type(payload).__name__}")
+    return payload
 
-def get_imdb_id(film, year=None):
-    if not film:
+
+def _candidate_score(title: str, year: int | None, candidate: dict[str, Any]) -> float:
+    candidate_title = candidate.get("title") or ""
+    original_title = candidate.get("original_title") or ""
+    title_score = max(
+        fuzz.token_set_ratio(title.casefold(), candidate_title.casefold()),
+        fuzz.token_set_ratio(title.casefold(), original_title.casefold()),
+    )
+
+    release_date = candidate.get("release_date") or ""
+    candidate_year = int(release_date[:4]) if release_date[:4].isdigit() else None
+    penalty = 0.0
+    if year and candidate_year and abs(candidate_year - year) > YEAR_TOLERANCE:
+        penalty = min(40.0, abs(candidate_year - year) * 5.0)
+    elif year and not candidate_year:
+        penalty = 5.0
+
+    language_bonus = 3.0 if candidate.get("original_language") == "hi" else 0.0
+    return title_score - penalty + language_bonus
+
+
+def get_imdb_id(
+    session: requests.Session,
+    film: str,
+    year: int | None,
+    tmdb_api_key: str,
+    cache: dict[tuple[str, int | None], str],
+) -> str:
+    """Resolve a film to an IMDb ID using fuzzy title and release-year matching."""
+    if not film or film in {"N/A", "(Non-film)"}:
         return ""
-    key = (film.strip().lower(), year)
-    if key in _imdb_cache:
-        return _imdb_cache[key]
-    params = {"api_key": TMDB_API_KEY, "query": film, "include_adult": "false"}
+
+    key = (film.strip().casefold(), year)
+    if key in cache:
+        return cache[key]
+
+    params: dict[str, Any] = {
+        "api_key": tmdb_api_key,
+        "query": film,
+        "include_adult": "false",
+    }
     if year:
         params["year"] = year
-    r = requests.get(f"{TMDB_BASE}/search/movie", params=params, timeout=15, verify=False)
-    results = (r.json() if r.ok else {}).get("results") or []
+
+    response = session.get(f"{TMDB_BASE_URL}/search/movie", params=params, timeout=20)
+    response.raise_for_status()
+    results = response.json().get("results") or []
+
     if not results and year:
         params.pop("year")
-        r = requests.get(f"{TMDB_BASE}/search/movie", params=params, timeout=15, verify=False)
-        results = (r.json() if r.ok else {}).get("results") or []
+        response = session.get(f"{TMDB_BASE_URL}/search/movie", params=params, timeout=20)
+        response.raise_for_status()
+        results = response.json().get("results") or []
+
     if not results:
-        _imdb_cache[key] = ""
+        cache[key] = ""
         return ""
-    best = max(results, key=lambda c: _score(film, year, c))
-    if _score(film, year, best) < MIN_MATCH_SCORE:
-        _imdb_cache[key] = ""
+
+    best = max(results, key=lambda item: _candidate_score(film, year, item))
+    if _candidate_score(film, year, best) < MIN_MATCH_SCORE:
+        cache[key] = ""
         return ""
-    r2 = requests.get(f"{TMDB_BASE}/movie/{best['id']}/external_ids", params={"api_key": TMDB_API_KEY}, timeout=15, verify=False)
-    imdb_id = (r2.json() if r2.ok else {}).get("imdb_id") or ""
-    _imdb_cache[key] = imdb_id
-    return imdb_id
 
-# ── Step 1: Scrape Giitaayan ──────────────────────────────────────
-print("Scraping Giitaayan...")
-all_songs = []
+    response = session.get(
+        f"{TMDB_BASE_URL}/movie/{best['id']}/external_ids",
+        params={"api_key": tmdb_api_key},
+        timeout=20,
+    )
+    response.raise_for_status()
+    cache[key] = response.json().get("imdb_id") or ""
+    return cache[key]
 
-for year in range(START_YEAR, END_YEAR + 1):
-    try:
-        r = requests.post(API_URL, json={"search_terms": f"year:{year}", "similarity_threshold": 0.1}, headers=HEADERS, timeout=15)
-        songs = r.json() if r.ok else []
-    except Exception as e:
-        print(f"  Error {year}: {e}")
-        songs = []
 
-    if songs:
+def scrape(
+    start_year: int,
+    end_year: int,
+    giitaayan_api_key: str,
+    tmdb_api_key: str | None,
+    delay_seconds: float,
+) -> pd.DataFrame:
+    """Collect Giitaayan songs and optionally enrich unique films with IMDb IDs."""
+    session = requests.Session()
+    records: list[dict[str, Any]] = []
+
+    for year in range(start_year, end_year + 1):
+        try:
+            songs = fetch_year(session, year, giitaayan_api_key)
+        except (requests.RequestException, ValueError) as exc:
+            print(f"{year}: skipped ({exc})")
+            continue
+
         print(f"{year}: {len(songs)} songs")
-        for s in songs:
-            all_songs.append({
-                "song_title": s.get("song_title", "N/A"),
-                "album":      s.get("album",      "N/A"),
-                "year":       s.get("year",        year),
-                "singer":     s.get("singer",     "N/A"),
-                "lyricist":   s.get("lyricist",   "N/A"),
-                "composer":   s.get("composer",   "N/A"),
-                "imdb_id":    "",
-            })
-    time.sleep(0.3)
+        records.extend(
+            {
+                "song_title": song.get("song_title") or "N/A",
+                "album": song.get("album") or "N/A",
+                "year": song.get("year") or year,
+                "singer": song.get("singer") or "N/A",
+                "lyricist": song.get("lyricist") or "N/A",
+                "composer": song.get("composer") or "N/A",
+                "imdb_id": "",
+            }
+            for song in songs
+        )
+        time.sleep(delay_seconds)
 
-print(f"\nScraped {len(all_songs)} songs. Now looking up IMDb IDs...")
+    if not tmdb_api_key:
+        return pd.DataFrame(records)
 
-# ── Step 2: Add IMDb IDs (cached per unique film) ─────────────────
-film_cache = {}
-for i, song in enumerate(all_songs):
-    album = song["album"]
-    year  = song["year"]
-    if album == "N/A":
-        continue
-    key = (album, year)
-    if key not in film_cache:
-        print(f"  [{len(film_cache)+1}] {album} ({year})")
-        yr = int(year) if str(year).isdigit() else None
-    film_cache[key] = get_imdb_id(album, yr)
-    song["imdb_id"] = film_cache[key]
+    film_cache: dict[tuple[str, int | None], str] = {}
+    for index, song in enumerate(records, start=1):
+        raw_year = str(song["year"])
+        year = int(raw_year) if raw_year.isdigit() else None
+        try:
+            song["imdb_id"] = get_imdb_id(
+                session,
+                str(song["album"]),
+                year,
+                tmdb_api_key,
+                film_cache,
+            )
+        except requests.RequestException as exc:
+            print(f"IMDb lookup failed for {song['album']}: {exc}")
+        if index % 100 == 0:
+            print(f"IMDb enrichment: {index}/{len(records)} songs")
 
-# ── Step 3: Save ──────────────────────────────────────────────────
-df = pd.DataFrame(all_songs)
-df.to_csv("giitaayan_songs.csv", index=False, encoding="utf-8-sig")
-print(f"\nDone! Saved {len(df)} songs to giitaayan_songs.csv")
-print(df.head(10).to
+    return pd.DataFrame(records)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start-year", type=int, default=1930)
+    parser.add_argument("--end-year", type=int, default=2025)
+    parser.add_argument("--output", type=Path, default=Path("giitaayan_songs.csv"))
+    parser.add_argument("--skip-imdb", action="store_true")
+    parser.add_argument("--delay", type=float, default=0.3)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    giitaayan_api_key = os.getenv("GIITAAYAN_API_KEY", "").strip()
+    if not giitaayan_api_key:
+        raise SystemExit("Set GIITAAYAN_API_KEY before running the scraper.")
+
+    tmdb_api_key = None if args.skip_imdb else os.getenv("TMDB_API_KEY", "").strip() or None
+    if not args.skip_imdb and not tmdb_api_key:
+        print("TMDB_API_KEY is missing; continuing without IMDb enrichment.")
+
+    frame = scrape(
+        args.start_year,
+        args.end_year,
+        giitaayan_api_key,
+        tmdb_api_key,
+        args.delay,
+    )
+    frame.to_csv(args.output, index=False, encoding="utf-8-sig")
+    print(f"Saved {len(frame):,} songs to {args.output}")
+    if not frame.empty:
+        print(frame.head(10).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
